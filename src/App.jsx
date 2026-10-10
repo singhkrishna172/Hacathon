@@ -30,6 +30,7 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(false);
   const [showForm, setShowForm] = useState(false);
+  const [currentNoteId, setCurrentNoteId] = useState(null);
 
   async function loadOperations() {
     const data = await getRoomOperations(ROOM_ID);
@@ -114,61 +115,147 @@ function App() {
 
 
 
-  async function handleCreateTask(event) {
-    event.preventDefault();
-
-    if (!title.trim()) {
-      setMessage("Enter a task title first.");
-      return;
-    }
-
+  async function handleCreateNote() {
     setLoading(true);
     setMessage("");
 
+    try {
+      const noteId = crypto.randomUUID();
+      const fields = {
+        title: "Untitled Note",
+        description: "",
+      };
+
+      for (const [field, value] of Object.entries(fields)) {
+        const operation = new SyncOperation({
+          opId: crypto.randomUUID(),
+          roomId: ROOM_ID,
+          clientId: CLIENT_ID,
+          taskId: noteId,
+          field: field,
+          value: value,
+          baseVersion: 0,
+          counter: Date.now(),
+        });
+
+        // Save locally
+        await queueOperation(operation.toDatabaseRow());
+
+        // Sync
+        try {
+          await saveOperation(operation);
+          await removeQueuedOperation(operation.opId);
+        } catch (syncError) {
+          console.warn("Sync postponed:", syncError);
+        }
+      }
+
+      setCurrentNoteId(noteId);
+      try { await loadOperations(); } catch (e) {}
+    } catch (error) {
+      console.error("Creation failed:", error);
+      setMessage(`Could not save locally: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleUpdateNote(field, value) {
+    if (!currentNoteId) return;
+    
     try {
       const operation = new SyncOperation({
         opId: crypto.randomUUID(),
         roomId: ROOM_ID,
         clientId: CLIENT_ID,
-        taskId: crypto.randomUUID(),
-        field: "title",
-        value: title.trim(),
+        taskId: currentNoteId,
+        field: field,
+        value: value,
         baseVersion: 0,
         counter: Date.now(),
       });
-
-      // Step 1: Save locally before contacting the server.
       await queueOperation(operation.toDatabaseRow());
-
-      // Step 2: Try to synchronize with Supabase.
       try {
         await saveOperation(operation);
-
-        // Remove from the queue only after a successful save.
         await removeQueuedOperation(operation.opId);
+      } catch (e) {}
+      await loadOperations();
+    } catch (e) {
+      console.error("Update failed:", e);
+    }
+  }
 
-        setMessage("Task saved and synchronized.");
-      } catch (syncError) {
-        console.warn("Sync postponed:", syncError);
+  async function handleUploadPdf(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
 
-        // Keep the operation in IndexedDB for a later retry.
-        setMessage(
-          "Task saved on this device. Synchronization is pending."
-        );
+    if (!navigator.onLine) {
+      alert("You must be online to upload real PDFs.");
+      return;
+    }
+
+    setLoading(true);
+    setMessage("Uploading PDF...");
+
+    try {
+      const filePath = `${ROOM_ID}/${crypto.randomUUID()}-${file.name}`;
+      const { data, error } = await supabase.storage.from("documents").upload(filePath, file);
+
+      if (error) {
+        throw new Error(error.message);
       }
 
-      setTitle("");
-      setShowForm(false);
+      const { data: publicData } = supabase.storage.from("documents").getPublicUrl(filePath);
+      await handleUpdateNote("pdf_url", publicData.publicUrl);
+      await handleUpdateNote("pdf_name", file.name);
+      
+      setMessage("PDF Attached!");
+    } catch (err) {
+      console.error("Upload error:", err);
+      alert(`Upload failed: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
 
-      // Refresh the server-backed task list when possible.
+  async function handleInviteMember() {
+    const name = prompt("Enter member name to invite:");
+    if (!name) return;
+
+    setLoading(true);
+    setMessage(`Inviting ${name}...`);
+
+    try {
+      const memberId = crypto.randomUUID();
+      const fields = { name, type: 'member', parent_id: 'members_list' };
+
+      for (const [field, value] of Object.entries(fields)) {
+        const operation = new SyncOperation({
+          opId: crypto.randomUUID(),
+          roomId: ROOM_ID,
+          clientId: CLIENT_ID,
+          taskId: memberId,
+          field: field,
+          value: value,
+          baseVersion: 0,
+          counter: Date.now(),
+        });
+        
+        await queueOperation(operation.toDatabaseRow());
+        try {
+          await saveOperation(operation);
+          await removeQueuedOperation(operation.opId);
+        } catch (e) {
+           console.warn("Member invite sync postponed:", e);
+        }
+      }
+      
+      setMessage(`${name} invited successfully.`);
       try {
         await loadOperations();
-      } catch (refreshError) {
-        console.warn("Could not refresh server tasks:", refreshError);
-      }
-    } catch (error) {
-      console.error("Task creation failed:", error);
-      setMessage(`Could not save task locally: ${error.message}`);
+      } catch (e) {}
+    } catch (e) {
+      console.error("Invite failed:", e);
     } finally {
       setLoading(false);
     }
@@ -176,11 +263,23 @@ function App() {
 
 
   const latestOperations = [...operations].reverse();
-  
-  // 1. Handle concurrent modifications & 2. Avoid overwriting users' changes
-  // 3. Identify independent edits (e.g. title vs status for the same task)
-  const { tasks, conflicts } = applyOperations(operations);
+  const { tasks: nodes, conflicts } = applyOperations(operations);
   const uniqueConflicts = new Set(conflicts.map(c => `${c.taskId}:${c.field}`));
+
+  // Extract notes (ignore members and pure folder edits from previous logic)
+  const notes = nodes.filter(
+    (n) => n.type !== 'member' && n.title !== undefined
+  );
+  
+  const currentNote = notes.find(n => n.task_id === currentNoteId);
+
+  // Extract synced members
+  const syncedMembers = nodes.filter(n => n.type === 'member');
+  // Combine current local user with synced invited users
+  const allMembers = [{ task_id: 'admin', name: "You (Admin)" }, ...syncedMembers];
+
+  // Fallback for legacy tasks (which used 'title' instead of 'name')
+  const legacyTasks = nodes.filter(n => n.title && !n.name);
 
   return (
     <div className="app-shell">
@@ -192,30 +291,47 @@ function App() {
 
         <div className="workspace-label">WORKSPACE</div>
 
-        <nav className="sidebar-nav">
-          <button className="nav-item active">
-            <span className="nav-icon">▦</span> Overview
+        <div style={{ padding: "16px", borderBottom: "1px solid #edf0f5" }}>
+          <button className="primary-button" style={{ width: "100%" }} onClick={handleCreateNote}>
+            <span>＋</span> New Note
           </button>
-          <button
-            className="nav-item"
-            onClick={() => document.getElementById("shared-tasks")?.scrollIntoView({ behavior: "smooth" })}
-          >
-            <span className="nav-icon">☷</span> Shared tasks
-          </button>
-          <button
-            className="nav-item"
-            onClick={() => document.getElementById("sync-activity")?.scrollIntoView({ behavior: "smooth" })}
-          >
-            <span className="nav-icon">⟳</span> Sync activity
-          </button>
-          <button
-            className="nav-item"
-            onClick={() => document.getElementById("conflict-summary")?.scrollIntoView({ behavior: "smooth" })}
-          >
-            <span className="nav-icon">⚡</span> Conflicts
-            <span className="nav-count">{uniqueConflicts.size}</span>
-          </button>
+        </div>
+
+        <nav className="sidebar-nav" style={{ padding: "16px" }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#9aa5b6", letterSpacing: 1.3, marginBottom: 10 }}>SHARED NOTES</div>
+          
+          {notes.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#8994a7" }}>No notes yet.</div>
+          ) : (
+            notes.map(note => (
+              <button 
+                key={note.task_id}
+                className={`nav-item ${currentNoteId === note.task_id ? 'active' : ''}`}
+                onClick={() => setCurrentNoteId(note.task_id)}
+                style={{ padding: "8px 12px", width: "100%", textAlign: "left", borderRadius: 6, marginBottom: 4, cursor: "pointer", border: "none", background: currentNoteId === note.task_id ? "#eff6ff" : "transparent" }}
+              >
+                <span className="nav-icon">📄</span> {note.title || 'Untitled Note'}
+              </button>
+            ))
+          )}
         </nav>
+
+        <div style={{ padding: "20px 16px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: "#9aa5b6", letterSpacing: 1.3 }}>MEMBERS</span>
+            <button onClick={handleInviteMember} style={{ border: 0, background: "transparent", color: "#2563eb", cursor: "pointer", fontSize: 11, fontWeight: 700 }}>+ Invite</button>
+          </div>
+          <div style={{ display: "grid", gap: 10 }}>
+            {allMembers.map(m => (
+              <div key={m.task_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#66738a" }}>
+                <div style={{ width: 24, height: 24, borderRadius: "50%", background: "#e7efff", color: "#2555b8", display: "grid", placeItems: "center", fontSize: 10, fontWeight: "bold" }}>
+                  {m.name ? m.name.charAt(0).toUpperCase() : '?'}
+                </div>
+                {m.name}
+              </div>
+            ))}
+          </div>
+        </div>
 
         <div className="sidebar-bottom">
           <div className="workspace-avatar">DS</div>
@@ -229,7 +345,9 @@ function App() {
 
       <main className="main-content">
         <header className="topbar">
-          <div className="breadcrumbs">Workspace <span>/</span> Overview</div>
+          <div className="breadcrumbs">
+            Workspace <span>/</span> Shared Notes
+          </div>
           <div className="topbar-right">
             <div className="connection-status">
               <span
@@ -249,111 +367,63 @@ function App() {
               <h1>Good to see you.</h1>
               <p>Keep your work in sync, even when your connection isn't.</p>
             </div>
-            <button className="primary-button" onClick={() => setShowForm(!showForm)}>
-              <span>＋</span> New task
-            </button>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="text-button" onClick={loadOperations}>↻ Refresh Sync</button>
+            </div>
           </div>
 
-          {showForm && (
-            <form className="panel" onSubmit={handleCreateTask} style={{ marginBottom: 20 }}>
-              <h2>Create a shared task</h2>
-              <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
-                <input
-                  value={title}
-                  onChange={(event) => setTitle(event.target.value)}
-                  placeholder="e.g. Prepare hackathon presentation"
-                  maxLength={200}
-                  style={{ flex: 1, minWidth: 0, padding: 12, border: "1px solid #dbe2ee", borderRadius: 8 }}
-                />
-                <button className="primary-button" disabled={loading || !connected}>
-                  {loading ? "Saving..." : "Save task"}
-                </button>
+          {currentNote ? (
+            <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+              <input 
+                type="text" 
+                defaultValue={currentNote.title} 
+                onBlur={(e) => handleUpdateNote("title", e.target.value)}
+                placeholder="Note Title..."
+                style={{ fontSize: 24, fontWeight: "bold", border: "none", borderBottom: "2px solid #edf0f5", padding: "10px 0", outline: "none" }}
+              />
+              
+              <textarea 
+                defaultValue={currentNote.description || ""}
+                onBlur={(e) => handleUpdateNote("description", e.target.value)}
+                placeholder="Write your note description here... (Saves automatically when you click outside)"
+                style={{ minHeight: 200, fontSize: 15, lineHeight: 1.6, border: "1px solid #edf0f5", borderRadius: 8, padding: 16, outline: "none", resize: "vertical" }}
+              />
+
+              <div style={{ background: "#f8fafc", padding: 16, borderRadius: 8, border: "1px solid #edf0f5", display: "flex", alignItems: "center", gap: 16 }}>
+                <div>
+                  <h4 style={{ margin: "0 0 4px 0", fontSize: 14 }}>Attachments</h4>
+                  {currentNote.pdf_url ? (
+                    <a href={currentNote.pdf_url} target="_blank" rel="noreferrer" style={{ fontSize: 13, color: "#2563eb", textDecoration: "none", display: "flex", alignItems: "center", gap: 6 }}>
+                      📄 {currentNote.pdf_name || 'View Attached PDF'}
+                    </a>
+                  ) : (
+                    <span style={{ fontSize: 13, color: "#8994a7" }}>No PDF attached yet.</span>
+                  )}
+                </div>
+                
+                <div style={{ marginLeft: "auto" }}>
+                  <label htmlFor="pdf-upload" className="secondary-button" style={{ border: "1px solid #d9e5ff", background: "#fff", color: "#2563eb", cursor: "pointer", display: "inline-block", padding: "8px 16px" }}>
+                    <span>↑</span> {loading ? 'Uploading...' : 'Attach PDF'}
+                  </label>
+                  <input 
+                    id="pdf-upload" 
+                    type="file" 
+                    accept=".pdf,.doc,.docx"
+                    onChange={handleUploadPdf}
+                    style={{ display: "none" }}
+                  />
+                </div>
               </div>
-            </form>
+            </div>
+          ) : (
+            <div className="empty-state" style={{ marginTop: 20 }}>
+              <div className="empty-icon">📝</div>
+              <h3>Select a note</h3>
+              <p>Choose a note from the sidebar or create a new one to start writing.</p>
+            </div>
           )}
 
-          {message && (
-            <p role="status" style={{ color: "#b45309", marginBottom: 18, overflowWrap: "anywhere" }}>
-              {message}
-            </p>
-          )}
-
-          <div className="welcome-banner">
-            <div className="welcome-copy">
-              <div className="banner-label"><span className="banner-sparkle">✳</span> BUILT FOR UNRELIABLE NETWORKS</div>
-              <h2>Your work doesn't stop when Wi-Fi does.</h2>
-              <p>Make changes locally. Synchronize when you're back online. Resolve conflicting edits without losing work.</p>
-            </div>
-            <div className="sync-illustration" aria-hidden="true">
-              <div className="sync-orbit orbit-one" />
-              <div className="sync-orbit orbit-two" />
-              <div className="sync-center">⟳</div>
-              <div className="sync-node node-one">✓</div>
-              <div className="sync-node node-two">↗</div>
-              <div className="sync-node node-three">↻</div>
-            </div>
-          </div>
-
-          <div className="section-heading">
-            <div>
-              <h2>Workspace overview</h2>
-              <p>A quick look at your collaboration activity.</p>
-            </div>
-          </div>
-
-          <div className="stats-grid">
-            <article className="stat-card">
-              <div className="stat-top"><span>Total operations</span><span className="stat-icon blue-icon">↗</span></div>
-              <div className="stat-value">{operations.length}</div>
-              <div className="stat-note">Shared changes recorded</div>
-            </article>
-            <article className="stat-card">
-              <div className="stat-top"><span>Pending sync</span><span className="stat-icon amber-icon">◷</span></div>
-              <div className="stat-value">Active</div>
-              <div className="stat-note">Offline queue pushes when back online</div>
-            </article>
-            <article className="stat-card" id="conflict-summary">
-              <div className="stat-top"><span>Potential conflicts</span><span className="stat-icon violet-icon">⇄</span></div>
-              <div className="stat-value">{uniqueConflicts.size}</div>
-              <div className="stat-note">Concurrent edits detected by a basic heuristic</div>
-            </article>
-          </div>
-
-          <div className="content-grid">
-            <section className="panel tasks-panel" id="shared-tasks">
-              <div className="panel-heading">
-                <div><h2>Shared tasks</h2><p>Your workspace's latest changes</p></div>
-                <button className="text-button" onClick={loadOperations}>Refresh ↻</button>
-              </div>
-
-              {tasks.length === 0 ? (
-                <div className="empty-state">
-                  <div className="empty-icon">☷</div>
-                  <h3>Your shared workspace starts here</h3>
-                  <p>Create a task to start recording collaborative changes.</p>
-                  <button className="secondary-button" onClick={() => setShowForm(true)}>＋ Create your first task</button>
-                </div>
-              ) : (
-                <div style={{ marginTop: 20 }}>
-                  {tasks.map((task) => (
-                    <article key={task.task_id} style={{ padding: "15px 0", borderTop: "1px solid #edf0f5" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                        <span style={{ color: "#2563eb", fontSize: 18 }}>☷</span>
-                        <div style={{ minWidth: 0, flex: 1 }}>
-                          <strong style={{ fontSize: 13, overflowWrap: "anywhere" }}>{String(task.value)}</strong>
-                          <p style={{ margin: "6px 0 0", fontSize: 10, color: "#8994a7" }}>
-                            Task ID: {task.task_id.slice(0, 8)} · Client: {task.client_id.slice(0, 12)}
-                          </p>
-                        </div>
-                        <span style={{ fontSize: 10, color: "#64748b" }}>
-                          {new Date(task.created_at).toLocaleDateString()}
-                        </span>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              )}
-            </section>
+          <div className="content-grid" style={{ marginTop: 40 }}>
 
             <section className="panel activity-panel" id="sync-activity">
               <div className="panel-heading">
