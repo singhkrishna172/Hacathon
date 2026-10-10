@@ -51,3 +51,72 @@ export function resolveConflict(operationA, operationB) {
         },
     };
 }
+
+
+/**
+ * Process a list of operations to compute the final state of each task,
+ * identifying conflicts and applying independent edits correctly.
+ */
+export function applyOperations(operations) {
+    const taskState = {};
+    const conflicts = [];
+    const fieldWinners = new Map();
+
+    for (const rawOp of operations) {
+        // Map database row format to our application model format
+        const op = {
+            opId: rawOp.op_id || rawOp.opId,
+            taskId: rawOp.task_id || rawOp.taskId,
+            field: rawOp.field,
+            value: rawOp.value,
+            baseVersion: rawOp.base_version !== undefined ? rawOp.base_version : rawOp.baseVersion,
+            counter: rawOp.counter,
+            clientId: rawOp.client_id || rawOp.clientId,
+            createdAt: rawOp.created_at || rawOp.createdAt
+        };
+
+        const key = `${op.taskId}:${op.field}`;
+        const existingOp = fieldWinners.get(key);
+
+        if (!existingOp) {
+            fieldWinners.set(key, op);
+        } else {
+            if (detectConflict(existingOp, op)) {
+                const resolution = resolveConflict(existingOp, op);
+                fieldWinners.set(key, resolution.winner);
+                conflicts.push(resolution.conflict);
+            } else {
+                // If not a concurrent conflict, still use tie-breaker logic to find the newest/winner
+                const resolution = resolveConflict(existingOp, op);
+                fieldWinners.set(key, resolution.winner);
+            }
+        }
+    }
+
+    // Reconstruct the tasks by combining independent field edits
+    for (const op of fieldWinners.values()) {
+        if (!taskState[op.taskId]) {
+            taskState[op.taskId] = {
+                task_id: op.taskId,
+                client_id: op.clientId,
+                created_at: op.createdAt,
+                counter: op.counter
+            };
+        }
+        
+        // Apply the field value (e.g., title, status, etc.)
+        taskState[op.taskId][op.field] = op.value;
+        
+        // Update task-level metadata to reflect the most recent operation
+        if (op.counter > taskState[op.taskId].counter) {
+            taskState[op.taskId].counter = op.counter;
+            taskState[op.taskId].client_id = op.clientId;
+            taskState[op.taskId].created_at = op.createdAt;
+        }
+    }
+
+    return {
+        tasks: Object.values(taskState).sort((a, b) => b.counter - a.counter),
+        conflicts,
+    };
+}

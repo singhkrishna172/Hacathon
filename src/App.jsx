@@ -9,6 +9,17 @@ import {
   getRoomOperations,
 } from "./services/syncService.js";
 
+import {
+  queueOperation,
+  getQueuedOperations,
+  removeQueuedOperation,
+} from "./services/localQueue.js";
+
+import { syncPendingOperations } from "./services/syncWorker.js";
+
+import { applyOperations } from "./engine/syncEngine.js";
+
+
 const ROOM_ID = "demo-room";
 const CLIENT_ID = "browser-" + crypto.randomUUID();
 
@@ -25,17 +36,63 @@ function App() {
     setOperations(data);
   }
 
+
   useEffect(() => {
     let active = true;
+    let channel;
+
+    const handleOnline = () => {
+      console.log("Network online, syncing pending operations...");
+      syncPendingOperations().then(() => loadOperations());
+    };
+    window.addEventListener("online", handleOnline);
 
     async function initialize() {
       try {
-        // Skipped auth check for demo since anonymous sign-ins are disabled
+        let {
+          data: { session },
+        } = await supabase.auth.getSession();
+
+        if (!session) {
+          const { data, error } =
+            await supabase.auth.signInAnonymously();
+
+          if (error) throw error;
+          session = data.session;
+        }
+
+        if (!session) {
+          throw new Error("No authentication session available.");
+        }
 
         if (!active) return;
 
         setConnected(true);
+        await syncPendingOperations();
         await loadOperations();
+
+        channel = supabase
+          .channel("replicasync-room")
+          .on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "sync_operations",
+              filter: "room_id=eq.demo-room",
+            },
+            async () => {
+              try {
+                await loadOperations();
+              } catch (error) {
+                console.error("Realtime refresh failed:", error);
+              }
+            }
+          )
+          .subscribe((status) => {
+            console.log("Realtime status:", status);
+          });
+
         if (active) setMessage("");
       } catch (error) {
         console.error("Initialization failed:", error);
@@ -47,8 +104,15 @@ function App() {
 
     return () => {
       active = false;
+      window.removeEventListener("online", handleOnline);
+
+      if (channel) {
+        supabase.removeChannel(channel);
+      }
     };
   }, []);
+
+
 
   async function handleCreateTask(event) {
     event.preventDefault();
@@ -73,55 +137,50 @@ function App() {
         counter: Date.now(),
       });
 
-      await saveOperation(operation);
+      // Step 1: Save locally before contacting the server.
+      await queueOperation(operation.toDatabaseRow());
+
+      // Step 2: Try to synchronize with Supabase.
+      try {
+        await saveOperation(operation);
+
+        // Remove from the queue only after a successful save.
+        await removeQueuedOperation(operation.opId);
+
+        setMessage("Task saved and synchronized.");
+      } catch (syncError) {
+        console.warn("Sync postponed:", syncError);
+
+        // Keep the operation in IndexedDB for a later retry.
+        setMessage(
+          "Task saved on this device. Synchronization is pending."
+        );
+      }
+
       setTitle("");
       setShowForm(false);
-      await loadOperations();
-      setMessage("Task saved successfully.");
+
+      // Refresh the server-backed task list when possible.
+      try {
+        await loadOperations();
+      } catch (refreshError) {
+        console.warn("Could not refresh server tasks:", refreshError);
+      }
     } catch (error) {
       console.error("Task creation failed:", error);
-      setMessage(`Could not save task: ${error.message}`);
+      setMessage(`Could not save task locally: ${error.message}`);
     } finally {
       setLoading(false);
     }
   }
 
+
   const latestOperations = [...operations].reverse();
-  const uniqueTasks = new Set(operations.map((item) => item.task_id));
-  const uniqueConflicts = new Set();
-
-  for (let i = 0; i < operations.length; i++) {
-    for (let j = i + 1; j < operations.length; j++) {
-      const a = operations[i];
-      const b = operations[j];
-
-      if (
-        a.task_id === b.task_id &&
-        a.field === b.field &&
-        a.base_version === b.base_version &&
-        a.client_id !== b.client_id
-      ) {
-        uniqueConflicts.add(`${a.task_id}:${a.field}:${a.base_version}`);
-      }
-    }
-  }
-
-  const taskMap = new Map();
-
-  for (const operation of operations) {
-    const existing = taskMap.get(operation.task_id);
-
-    if (
-      !existing ||
-      operation.counter > existing.counter ||
-      (operation.counter === existing.counter &&
-        operation.client_id.localeCompare(existing.client_id) > 0)
-    ) {
-      taskMap.set(operation.task_id, operation);
-    }
-  }
-
-  const tasks = [...taskMap.values()].reverse();
+  
+  // 1. Handle concurrent modifications & 2. Avoid overwriting users' changes
+  // 3. Identify independent edits (e.g. title vs status for the same task)
+  const { tasks, conflicts } = applyOperations(operations);
+  const uniqueConflicts = new Set(conflicts.map(c => `${c.taskId}:${c.field}`));
 
   return (
     <div className="app-shell">
@@ -250,8 +309,8 @@ function App() {
             </article>
             <article className="stat-card">
               <div className="stat-top"><span>Pending sync</span><span className="stat-icon amber-icon">◷</span></div>
-              <div className="stat-value">0</div>
-              <div className="stat-note">Offline queue not implemented yet</div>
+              <div className="stat-value">Active</div>
+              <div className="stat-note">Offline queue pushes when back online</div>
             </article>
             <article className="stat-card" id="conflict-summary">
               <div className="stat-top"><span>Potential conflicts</span><span className="stat-icon violet-icon">⇄</span></div>
@@ -321,7 +380,7 @@ function App() {
 
               <div className="sync-info">
                 <span className="info-icon">i</span>
-                <p>Offline queue and automatic conflict resolution are still under development.</p>
+                <p>Background sync queue and automatic conflict resolution are now fully active.</p>
               </div>
             </section>
           </div>
